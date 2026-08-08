@@ -8,6 +8,7 @@ import base64
 import json
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from PyQt5.QtCore import (
@@ -24,6 +25,7 @@ from PyQt5.QtCore import (
 from PyQt5.QtGui import (
     QColor,
     QDesktopServices,
+    QFont,
     QIcon,
     QPainter,
     QPainterPath,
@@ -37,6 +39,9 @@ from PyQt5.QtWidgets import (
     QFrame,
     QHeaderView,
     QHBoxLayout,
+    QLabel,
+    QScrollArea,
+    QStackedWidget,
     QTableWidgetItem,
     QTextBrowser,
     QVBoxLayout,
@@ -76,6 +81,7 @@ from download_thread import (
     ThreadData,
     ThreadDownloader,
     export_thread,
+    is_supported_host,
     normalize_url,
     render_post_body_html,
 )
@@ -180,6 +186,11 @@ class ProfileWorker(QThread):
                     self.generation, page, works
                 ),
             )
+            if profile.avatar_url:
+                try:
+                    profile.avatar_bytes = downloader.avatar_bytes(profile.avatar_url)
+                except Exception:
+                    pass
             self.profileReady.emit(self.generation, profile)
         except Exception as exc:
             self.failed.emit(self.generation, str(exc))
@@ -283,7 +294,8 @@ class DownloadInterface(QWidget):
         query_row.setSpacing(10)
         self.urlEdit = LineEdit(query_card)
         self.urlEdit.setPlaceholderText(
-            "例如：1073768508 或 mirror.chromaso.net/thread/1073768508"
+            "例如：1073768508、mirror.chromaso.net/thread/1073768508 "
+            "或 1011.lol/thread/1073768508"
         )
         self.urlEdit.setClearButtonEnabled(True)
         self.urlEdit.setMinimumWidth(440)
@@ -356,6 +368,9 @@ class DownloadInterface(QWidget):
         self.authorTable.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.authorTable.setSelectionMode(QAbstractItemView.SingleSelection)
         self.authorTable.setIconSize(QSize(42, 42))
+        author_table_font = QFont("Microsoft YaHei", 10)
+        self.authorTable.setFont(author_table_font)
+        self.authorTable.horizontalHeader().setFont(author_table_font)
         header = self.authorTable.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Fixed)
         header.setSectionResizeMode(1, QHeaderView.Fixed)
@@ -472,10 +487,13 @@ class DownloadInterface(QWidget):
 
 class ContentInterface(QWidget):
     linkActivated = pyqtSignal(str)
+    profileThreadRequested = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("contentInterface")
+        self._profileData: AuthorProfileData | None = None
+        self._profileAvatar = QPixmap()
         root = QVBoxLayout(self)
         root.setContentsMargins(28, 24, 28, 24)
         root.setSpacing(12)
@@ -490,38 +508,201 @@ class ContentInterface(QWidget):
         header.addWidget(self.progressBar)
         root.addLayout(header)
 
-        card = CardWidget(self)
-        card_layout = QVBoxLayout(card)
+        self.card = CardWidget(self)
+        self.card.setStyleSheet(
+            "CardWidget { background: rgba(255, 255, 255, 222); "
+            "border: 1px solid rgba(215, 221, 230, 220); border-radius: 16px; }"
+        )
+        card_layout = QVBoxLayout(self.card)
         card_layout.setContentsMargins(10, 10, 10, 10)
-        self.browser = QTextBrowser(card)
+
+        self.contentStack = QStackedWidget(self.card)
+        self.browser = QTextBrowser(self.card)
         self.browser.setOpenLinks(False)
         self.browser.setOpenExternalLinks(False)
         self.browser.setFrameShape(QFrame.NoFrame)
+        self.browser.setStyleSheet(
+            "QTextBrowser { background: transparent; border: none; }"
+        )
         self.browser.anchorClicked.connect(
             lambda url: self.linkActivated.emit(url.toString())
         )
-        card_layout.addWidget(self.browser)
-        root.addWidget(card, 1)
+
+        self.profileScroll = QScrollArea(self.card)
+        self.profileScroll.setWidgetResizable(True)
+        self.profileScroll.setFrameShape(QFrame.NoFrame)
+        self.profileScroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        self.profileBody = QWidget(self.profileScroll)
+        self.profileLayout = QVBoxLayout(self.profileBody)
+        self.profileLayout.setContentsMargins(14, 14, 14, 14)
+        self.profileLayout.setSpacing(12)
+        self.profileScroll.setWidget(self.profileBody)
+
+        self.contentStack.addWidget(self.browser)
+        self.contentStack.addWidget(self.profileScroll)
+        card_layout.addWidget(self.contentStack)
+        root.addWidget(self.card, 1)
 
     def set_loading(self, title: str) -> None:
+        self._profileData = None
         self.titleLabel.setText(title)
+        self.contentStack.setCurrentWidget(self.browser)
         self.browser.clear()
         self.progressBar.setVisible(True)
         self.progressBar.resume()
 
     def set_html(self, title: str, content: str) -> None:
+        self._profileData = None
         self.titleLabel.setText(title)
+        self.contentStack.setCurrentWidget(self.browser)
         self.progressBar.pause()
         self.progressBar.setVisible(False)
         self.browser.setHtml(content)
         self.browser.moveCursor(QTextCursor.Start)
 
     def set_error(self, message: str) -> None:
+        self.contentStack.setCurrentWidget(self.browser)
         self.progressBar.pause()
         self.progressBar.setVisible(False)
         self.browser.setHtml(
             f"<h2>加载失败</h2><p>{html.escape(message)}</p>"
         )
+
+    def set_profile(self, profile: AuthorProfileData, avatar: QPixmap) -> None:
+        """以原生卡片展示个人资料和每个公开主题。"""
+        self._profileData = profile
+        self._profileAvatar = QPixmap(avatar)
+        while self.profileLayout.count():
+            item = self.profileLayout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        header = CardWidget(self.profileBody)
+        header.setStyleSheet(
+            "CardWidget { background: rgba(255,255,255,232); "
+            "border: 1px solid rgba(211,218,229,230); border-radius: 15px; }"
+        )
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(18, 17, 18, 17)
+        avatar_label = QLabel(header)
+        avatar_label.setPixmap(avatar)
+        avatar_label.setFixedSize(76, 76)
+        header_layout.addWidget(avatar_label, 0, Qt.AlignTop)
+        text_layout = QVBoxLayout()
+        name = TitleLabel(profile.name, header)
+        name.setStyleSheet("font-family: 'Microsoft YaHei';")
+        introduction = profile.bio.strip() or "该用户暂未填写个人介绍。"
+        intro = BodyLabel(introduction, header)
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #687385; font-family: 'Microsoft YaHei';")
+        address = CaptionLabel(profile.profile_url, header)
+        address.setStyleSheet("color: #8a95a5; font-family: 'Microsoft YaHei';")
+        text_layout.addWidget(name)
+        text_layout.addWidget(intro)
+        text_layout.addWidget(address)
+        header_layout.addLayout(text_layout, 1)
+        self.profileLayout.addWidget(header)
+
+        summary = StrongBodyLabel(f"公开主题 · {len(profile.works)}", self.profileBody)
+        summary.setStyleSheet("font-family: 'Microsoft YaHei'; margin: 6px 2px 0;")
+        self.profileLayout.addWidget(summary)
+        for work in profile.works:
+            work_card = ProfileWorkCard(work, self.profileBody)
+            work_card.threadRequested.connect(self.profileThreadRequested)
+            self.profileLayout.addWidget(work_card)
+        self.profileLayout.addStretch(1)
+        self.profileScroll.verticalScrollBar().setValue(0)
+        self.contentStack.setCurrentWidget(self.profileScroll)
+        self.progressBar.pause()
+        self.progressBar.setVisible(False)
+        self.titleLabel.setText(f"{profile.name} · 个人主页")
+
+    def snapshot(self) -> dict[str, object]:
+        """保存内容页状态，使同一页面内的深入浏览也可逐层返回。"""
+        return {
+            "title": self.titleLabel.text(),
+            "html": self.browser.toHtml(),
+            "is_profile": self._profileData is not None,
+            "profile": self._profileData,
+            "avatar": QPixmap(self._profileAvatar),
+            "browser_scroll": self.browser.verticalScrollBar().value(),
+            "profile_scroll": self.profileScroll.verticalScrollBar().value(),
+        }
+
+    def restore_snapshot(self, snapshot: dict[str, object]) -> None:
+        if snapshot["is_profile"]:
+            self.set_profile(snapshot["profile"], snapshot["avatar"])
+            self.profileScroll.verticalScrollBar().setValue(
+                int(snapshot.get("profile_scroll", 0))
+            )
+        else:
+            self.set_html(str(snapshot["title"]), str(snapshot["html"]))
+            self.browser.verticalScrollBar().setValue(
+                int(snapshot.get("browser_scroll", 0))
+            )
+
+
+@dataclass
+class NavigationEntry:
+    page: QWidget
+    content_snapshot: dict[str, object] | None = None
+
+
+class ProfileWorkCard(CardWidget):
+    """带悬浮反馈的作者主题卡片。"""
+
+    threadRequested = pyqtSignal(str)
+
+    def __init__(self, work, parent=None):
+        super().__init__(parent)
+        self.work_url = work.url
+        self.setCursor(Qt.PointingHandCursor)
+        self._set_hovered(False)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 15, 18, 15)
+        layout.setSpacing(7)
+        title = StrongBodyLabel(work.title, self)
+        title.setWordWrap(True)
+        title.setStyleSheet("font-family: 'Microsoft YaHei'; font-size: 15px;")
+        details = " · ".join(
+            item
+            for item in (
+                work.forum,
+                f"{work.reply_count} 回复" if work.reply_count else "",
+                f"发布于 {work.published}" if work.published else "",
+                f"更新于 {work.last_updated}" if work.last_updated else "",
+            )
+            if item
+        )
+        meta = CaptionLabel(details or "点击查看主题", self)
+        meta.setStyleSheet("color: #7d8898; font-family: 'Microsoft YaHei';")
+        layout.addWidget(title)
+        layout.addWidget(meta)
+
+    def _set_hovered(self, hovered: bool) -> None:
+        if hovered:
+            self.setStyleSheet(
+                "CardWidget { background: rgba(255,255,255,248); "
+                "border: 1px solid rgba(97, 151, 191, 190); border-radius: 14px; }"
+            )
+        else:
+            self.setStyleSheet(
+                "CardWidget { background: rgba(255,255,255,218); "
+                "border: 1px solid rgba(218,223,232,220); border-radius: 14px; }"
+            )
+
+    def enterEvent(self, event) -> None:
+        self._set_hovered(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._set_hovered(False)
+        super().leaveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton and self.rect().contains(event.pos()):
+            self.threadRequested.emit(self.work_url)
+        super().mouseReleaseEvent(event)
 
 
 class LogInterface(QWidget):
@@ -735,6 +916,14 @@ class MainWindow(FluentWindow):
         self._savedSettingsValues: dict[str, object] = {}
         self._navigationGuard = False
         self._previousInterface: QWidget = self.downloadPage
+        self.navigationHistory: list[NavigationEntry] = [
+            NavigationEntry(self.downloadPage)
+        ]
+        self._historyGoingBack = False
+        self._returnButtonSlot = lambda _checked=False: self.go_back()
+        # 把异步内容请求与创建它的历史项绑定。这样请求在切到侧栏页面后
+        # 完成时，更新的是原历史项，而不是错误地覆盖当前页面的历史。
+        self._contentRequestEntries: dict[tuple[str, int], NavigationEntry] = {}
         self.threadData: ThreadData | None = None
         self.authors: list[Author] = []
         self.authorRows: dict[str, int] = {}
@@ -755,8 +944,12 @@ class MainWindow(FluentWindow):
         self._connect_signals()
         self._load_settings()
         self._init_window()
+        self._apply_glass_surfaces()
 
     def _init_navigation(self) -> None:
+        # 固定保留返回按钮的槽位：首层不绘制图标，后续层只在原位启用，
+        # 防止导航项目因按钮突然出现而发生跳动。
+        self.navigationInterface.setReturnButtonVisible(True)
         self.addSubInterface(self.downloadPage, FIF.DOWNLOAD, "主题下载")
         self.addSubInterface(self.searchPage, FIF.SEARCH, "搜索")
         self.addSubInterface(self.contentPage, FIF.DOCUMENT, "内容浏览")
@@ -771,6 +964,7 @@ class MainWindow(FluentWindow):
         # 禁用页面切换动画，规避 qfluentwidgets 1.11.x 在动画结束时
         # 重复 disconnect 信号导致的崩溃。
         self.stackedWidget.setAnimationEnabled(False)
+        self._update_return_button()
 
     def _connect_signals(self) -> None:
         page = self.downloadPage
@@ -781,6 +975,23 @@ class MainWindow(FluentWindow):
         page.selectAllChanged.connect(self.set_all_authors_selected)
         page.profileRequested.connect(self.open_profile)
         self.contentPage.linkActivated.connect(self.on_content_link)
+        self.contentPage.profileThreadRequested.connect(self.load_thread_in_viewer)
+        return_button = self.navigationInterface.panel.returnButton
+        # FluentWidgets 默认把该按钮交给全局路由器。不能按某个 bound
+        # method 精确断开：PyQt 会为它创建新的包装对象，导致原槽仍会执行，
+        # 从而在本地栈返回后又被全局路由器带回首页。
+        # 清空 clicked 上的既有槽位后，仅保留本程序自己的历史栈处理器。
+        try:
+            return_button.clicked.disconnect()
+        except TypeError:
+            pass
+        try:
+            self.navigationInterface.panel.history.emptyChanged.disconnect(
+                return_button.setDisabled
+            )
+        except TypeError:
+            pass
+        return_button.clicked.connect(self._returnButtonSlot)
         self.logPage.clearRequested.connect(self.clear_logs)
         self.logPage.filterChanged.connect(self.render_logs)
         self.settingsPage.saveRequested.connect(self.save_settings)
@@ -800,6 +1011,109 @@ class MainWindow(FluentWindow):
             desktop.center().x() - self.width() // 2,
             desktop.center().y() - self.height() // 2,
         )
+
+    def _apply_glass_surfaces(self) -> None:
+        """使用半透明卡片、柔和描边和渐变底色营造轻量玻璃质感。"""
+        glass = """
+        QWidget#downloadInterface, QWidget#settingsInterface, QWidget#logInterface,
+        QWidget#contentInterface {
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                stop:0 #f7f9fc, stop:0.5 #eef3f8, stop:1 #f8fafc);
+        }
+        CardWidget {
+            background: rgba(255, 255, 255, 216);
+            border: 1px solid rgba(214, 221, 231, 210);
+            border-radius: 16px;
+        }
+        """
+        for page in (self.downloadPage, self.settingsPage, self.logPage):
+            page.setStyleSheet(glass)
+
+    def _update_return_button(self) -> None:
+        button = self.navigationInterface.panel.returnButton
+        can_return = len(self.navigationHistory) > 1
+        # 始终可见以保留布局位置；首页改为空图标并禁用，不显示返回箭头。
+        button.setVisible(True)
+        button.setEnabled(can_return)
+        button.setIcon(FIF.RETURN if can_return else QIcon())
+
+    def _make_navigation_entry(self, target: QWidget) -> NavigationEntry:
+        snapshot = self.contentPage.snapshot() if target is self.contentPage else None
+        return NavigationEntry(target, snapshot)
+
+    def _refresh_current_content_history(
+        self, entry: NavigationEntry | None = None
+    ) -> None:
+        """保存内容页现状，可更新栈顶或仍留在栈中的异步历史项。"""
+        if entry is None:
+            if not self.navigationHistory:
+                return
+            entry = self.navigationHistory[-1]
+        if entry.page is not self.contentPage or not any(
+            item is entry for item in self.navigationHistory
+        ):
+            return
+        entry.content_snapshot = self.contentPage.snapshot()
+
+    def _invalidate_content_requests(self) -> None:
+        """使所有旧的主页/帖子请求失效，防止完成后覆盖已返回的页面。"""
+        self.profileGeneration += 1
+        self.viewerGeneration += 1
+        for worker in (self.profileWorker, self.viewerThreadWorker):
+            if worker and worker.isRunning():
+                worker.requestInterruption()
+        self._contentRequestEntries.clear()
+
+    def _show_loading_content(self, title: str) -> NavigationEntry:
+        """进入一个新的内容层，并返回与该层对应的历史项。"""
+        content_was_active = self.stackedWidget.currentWidget() is self.contentPage
+        if content_was_active:
+            # 覆盖内容前先保存用户当前看到的内容及滚动位置。
+            self._refresh_current_content_history()
+        self.contentPage.set_loading(title)
+        self.switchTo(self.contentPage)
+        if content_was_active:
+            # 同一 QWidget 内部切换不会发出 currentChanged，必须显式压栈。
+            self._commit_navigation(self.contentPage, force=True)
+        return self.navigationHistory[-1]
+
+    def _restore_navigation_entry(self, entry: NavigationEntry) -> None:
+        if entry.page is self.contentPage and entry.content_snapshot is not None:
+            self.contentPage.restore_snapshot(entry.content_snapshot)
+
+    def _commit_navigation(self, target: QWidget, force: bool = False) -> None:
+        if self._historyGoingBack:
+            if len(self.navigationHistory) > 1 and self.navigationHistory[-2].page is target:
+                self.navigationHistory.pop()
+            else:
+                self.navigationHistory = [self._make_navigation_entry(target)]
+            self._historyGoingBack = False
+        elif (
+            force
+            or not self.navigationHistory
+            or self.navigationHistory[-1].page is not target
+        ):
+            self.navigationHistory.append(self._make_navigation_entry(target))
+        self._update_return_button()
+
+    def go_back(self) -> None:
+        """撤销最近一次导航，逐层恢复上一个界面或内容状态。"""
+        if len(self.navigationHistory) < 2:
+            self._update_return_button()
+            return
+        current = self.navigationHistory[-1]
+        if any(entry is current for entry in self._contentRequestEntries.values()):
+            # 用户在加载完成前返回时，旧请求的回调不能再把页面切回来。
+            self._invalidate_content_requests()
+        target = self.navigationHistory[-2]
+        self._historyGoingBack = True
+        if target.page is self.contentPage:
+            # 同一 QWidget 内的帖子/主页切换不会触发 currentChanged，需手动提交。
+            self._commit_navigation(target.page)
+            self._restore_navigation_entry(target)
+        else:
+            self.switchTo(target.page)
+            self._restore_navigation_entry(target)
 
     def track_worker(self, worker: QThread) -> None:
         """保留所有后台线程，避免快速切换内容时线程被提前销毁。"""
@@ -895,6 +1209,9 @@ class MainWindow(FluentWindow):
         if self._navigationGuard:
             return
         target = self.stackedWidget.widget(index)
+        if self._previousInterface is self.contentPage and target is not self.contentPage:
+            # 离开内容页时保存最后的滚动位置；返回时恢复到离开前的状态。
+            self._refresh_current_content_history()
         if (
             self._previousInterface is self.settingsPage
             and target is not self.settingsPage
@@ -921,15 +1238,18 @@ class MainWindow(FluentWindow):
             if dialog.exec():
                 if self.save_settings(show_notice=False):
                     self._previousInterface = target
+                    self._commit_navigation(target)
                     return
             elif choice["discard"]:
                 self._load_settings()
                 self._previousInterface = target
+                self._commit_navigation(target)
                 return
 
             # 取消，或保存校验失败：下一轮事件循环再返回设置页，避免在
             # stackedWidget.currentChanged 信号内部重入页面切换。
             self._previousInterface = self.settingsPage
+            self._historyGoingBack = False
 
             def return_to_settings() -> None:
                 self._navigationGuard = True
@@ -939,6 +1259,7 @@ class MainWindow(FluentWindow):
             QTimer.singleShot(0, return_to_settings)
             return
         self._previousInterface = target
+        self._commit_navigation(target)
 
     def show_info(self, title: str, content: str, level: str = "INFO") -> None:
         kwargs = dict(
@@ -963,22 +1284,41 @@ class MainWindow(FluentWindow):
         bar = InfoBar.success(
             title="导出完成",
             content=f"已导出 {count} 条发言。",
-            orient=Qt.Horizontal,
+            orient=Qt.Vertical,
             isClosable=True,
             position=InfoBarPosition.TOP_RIGHT,
             duration=10000,
-            parent=self,
+            # 以内容堆栈为父对象，避免顶层窗口坐标与 InfoBar 动画叠加时
+            # 把操作按钮推到屏幕右侧。
+            parent=self.stackedWidget,
         )
-        open_directory = PushButton("打开目录", bar)
-        open_file = PrimaryPushButton("打开文件", bar)
+        # 垂直提示条把操作区放在正文下方，避免横向内容把按钮挤到窗口外。
+        bar.setFixedWidth(430)
+        actions = QWidget(bar)
+        actions_layout = QHBoxLayout(actions)
+        actions_layout.setContentsMargins(0, 2, 0, 0)
+        actions_layout.setSpacing(8)
+        open_directory = PushButton("打开目录", actions)
+        open_file = PrimaryPushButton("打开文件", actions)
+        actions_layout.addWidget(open_directory)
+        actions_layout.addWidget(open_file)
+        actions_layout.addStretch(1)
         open_directory.clicked.connect(
             lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(output.parent)))
         )
         open_file.clicked.connect(
             lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(output)))
         )
-        bar.addWidget(open_directory)
-        bar.addWidget(open_file)
+        bar.addWidget(actions)
+
+        def correct_info_bar_position() -> None:
+            # qfluentwidgets 在部分 Windows/DPI 组合下会把顶层窗口坐标
+            # 混入右上角动画终点；动画结束后以内容区域的本地坐标重新定位。
+            parent = bar.parentWidget()
+            if parent and bar.isVisible():
+                bar.move(max(12, parent.width() - bar.width() - 24), 24)
+
+        QTimer.singleShot(260, correct_info_bar_position)
 
     def start_fetch(self) -> None:
         try:
@@ -1069,6 +1409,7 @@ class MainWindow(FluentWindow):
         table = self.downloadPage.authorTable
         table.setRowCount(len(self.authors))
         self.authorRows.clear()
+        author_font = QFont("Microsoft YaHei", 10)
         for row, author in enumerate(self.authors):
             self.authorRows[author.key] = row
             table.setRowHeight(row, 60)
@@ -1084,17 +1425,15 @@ class MainWindow(FluentWindow):
             avatar_item.setIcon(QIcon(self.make_placeholder(author.name)))
             name_item = QTableWidgetItem(author.name)
             name_item.setToolTip("单击查看作者个人主页与公开主题")
-            name_font = name_item.font()
-            name_font.setUnderline(True)
-            name_item.setFont(name_font)
+            name_item.setFont(author_font)
+            name_item.setForeground(QColor("#202124"))
             count_item = QTableWidgetItem(str(author.post_count))
+            count_item.setFont(author_font)
             count_item.setTextAlignment(Qt.AlignCenter)
             profile_item = QTableWidgetItem(author.profile_url or "（无公开主页）")
             profile_item.setToolTip(author.profile_url)
-            if author.profile_url:
-                profile_font = profile_item.font()
-                profile_font.setUnderline(True)
-                profile_item.setFont(profile_font)
+            profile_item.setFont(author_font)
+            profile_item.setForeground(QColor("#4d6b87"))
             table.setCellWidget(row, 0, selector_cell)
             table.setItem(row, 1, avatar_item)
             table.setItem(row, 2, name_item)
@@ -1225,6 +1564,7 @@ class MainWindow(FluentWindow):
         target.fill(Qt.transparent)
         painter = QPainter(target)
         painter.setRenderHint(QPainter.Antialiasing)
+        painter.setCompositionMode(QPainter.CompositionMode_Source)
         path = QPainterPath()
         path.addEllipse(0, 0, size, size)
         painter.setClipPath(path)
@@ -1241,6 +1581,10 @@ class MainWindow(FluentWindow):
     def build_thread_view_html(
         self, data: ThreadData, avatar_bytes: dict[str, bytes]
     ) -> str:
+        tags = "".join(
+            f'<a class="tag" href="{html.escape(url, quote=True)}">{html.escape(name)}</a>'
+            for name, url in data.tags
+        )
         articles: list[str] = []
         for post in data.posts:
             key = post.profile_url or post.author
@@ -1251,37 +1595,51 @@ class MainWindow(FluentWindow):
                     f'<a href="{html.escape(post.profile_url, quote=True)}">{author}</a>'
                 )
             body = render_post_body_html(data, post, max_image_width=820)
+            post_title = data.title if post.floor == 1 else f"Re: {data.title}"
             articles.append(
-                '<section class="post">'
-                '<div class="post-head">'
-                f'<img class="avatar" src="{avatar}" width="52" height="52"/>'
-                '<div class="post-meta">'
+                '<table class="post" width="100%" cellspacing="0" cellpadding="0">'
+                '<tr class="post-head">'
+                f'<td class="avatar-cell" width="62"><img class="avatar" src="{avatar}" width="48" height="48"/></td>'
+                '<td class="author-cell">'
                 f'<div class="author">{author}</div>'
-                f'<div class="time">{html.escape(post.published)} · 第 {post.floor} 楼</div>'
-                '</div></div>'
-                f'<div class="body">{body}</div>'
-                '</section>'
+                f'<div class="post-title">{html.escape(post_title)}</div>'
+                '</td>'
+                f'<td class="time-cell" align="right" valign="top">{html.escape(post.published)}</td>'
+                '</tr>'
+                f'<tr><td class="body" colspan="3">{body}</td></tr>'
+                f'<tr><td class="post-footer" colspan="3">第 {post.floor} 楼</td></tr>'
+                '</table>'
             )
         return f'''<!doctype html><html><head><meta charset="utf-8"/>
 <style>
-body {{ margin: 8px; color: #202124; font-family: "Microsoft YaHei", Arial, sans-serif; }}
-h1 {{ color: {self.accentColor.name()}; margin: 4px 0 18px; }}
-.post {{ border: 1px solid #d9e2ec; margin: 0 0 14px; padding: 14px; }}
-.post-head {{ margin-bottom: 12px; }}
-.avatar {{ float: left; margin-right: 12px; }}
-.post-meta {{ min-height: 54px; padding-top: 4px; }}
+body {{ margin: 14px; color: #596577; background: #fcfcfc; font-family: "Microsoft YaHei", Arial, sans-serif; }}
+h1 {{ color: #5a6577; font-size: 29px; font-weight: normal; margin: 8px 0 22px; }}
+.tags {{ margin: -10px 0 18px; }}
+.tag {{ color: #788699; background: #edf1f5; border: 1px solid #dce3ea; border-radius: 10px; display: inline-block; font-size: 12px; margin: 0 6px 6px 0; padding: 3px 9px; text-decoration: none; }}
+.post {{ background: #ffffff; border: 1px solid #d7d9df; border-collapse: collapse; margin: 0 0 18px; }}
+.post-head {{ background: #f5f5f7; border-bottom: 1px solid #d7d9df; }}
+.avatar-cell {{ padding: 9px 5px 8px 14px; vertical-align: middle; }}
+.avatar {{ border-radius: 24px; }}
+.author-cell {{ padding: 8px 6px; vertical-align: middle; }}
 .author {{ font-size: 16px; font-weight: bold; }}
-.author a {{ color: {self.accentColor.name()}; text-decoration: none; }}
-.time {{ color: #667085; font-size: 12px; margin-top: 5px; }}
-.body {{ clear: both; line-height: 1.65; word-break: normal; }}
+.author a {{ color: #c27699; text-decoration: none; }}
+.post-title {{ color: #7e8795; font-size: 13px; margin-top: 3px; }}
+.time-cell {{ color: #8a93a1; font-size: 13px; padding: 13px 15px 8px 6px; white-space: nowrap; }}
+.body {{ color: #5b6677; padding: 16px 15px; line-height: 1.72; word-break: normal; }}
+.body p {{ margin: 0 0 12px; }}
 .body img {{ height: auto; max-width: 100%; }}
-.body a {{ color: {self.accentColor.name()}; text-decoration: underline; }}
-.body blockquote {{ border-left: 3px solid {self.accentColor.name()}; margin-left: 0; padding-left: 10px; }}
-</style></head><body><h1>{html.escape(data.title)}</h1>{''.join(articles)}</body></html>'''
+.body a {{ color: #6d9ec2; text-decoration: none; }}
+.body blockquote {{ color: #6c7686; background: #f7f8fa; border-left: 3px solid #c9d0da; margin: 8px 0; padding: 8px 10px; }}
+.post-footer {{ color: #78a9cb; border-top: 1px solid #e2e3e6; font-size: 12px; padding: 9px 15px; }}
+</style></head><body><h1>{html.escape(data.title)}</h1><div class="tags">{tags}</div>{''.join(articles)}</body></html>'''
 
     def show_current_thread(self) -> None:
         if not self.threadData:
             return
+        self._invalidate_content_requests()
+        content_was_active = self.stackedWidget.currentWidget() is self.contentPage
+        if content_was_active:
+            self._refresh_current_content_history()
         self.contentAuthors = {
             QUrl(author.profile_url).path(): author
             for author in self.threadData.authors()
@@ -1292,6 +1650,8 @@ h1 {{ color: {self.accentColor.name()}; margin: 4px 0 18px; }}
             self.build_thread_view_html(self.threadData, self.avatarBytes),
         )
         self.switchTo(self.contentPage)
+        if content_was_active:
+            self._commit_navigation(self.contentPage, force=True)
 
     def open_profile(self, row: int) -> None:
         if not (0 <= row < len(self.authors)):
@@ -1303,12 +1663,10 @@ h1 {{ color: {self.accentColor.name()}; margin: 4px 0 18px; }}
         self.load_author_profile(author)
 
     def load_author_profile(self, author: Author) -> None:
-        self.profileGeneration += 1
+        self._invalidate_content_requests()
         generation = self.profileGeneration
-        if self.profileWorker and self.profileWorker.isRunning():
-            self.profileWorker.requestInterruption()
-        self.contentPage.set_loading(f"{author.name} · 个人主页")
-        self.switchTo(self.contentPage)
+        entry = self._show_loading_content(f"{author.name} · 个人主页")
+        self._contentRequestEntries[("profile", generation)] = entry
         worker = ProfileWorker(
             generation, author, self.settingsPage.pageDelaySpin.value(), self
         )
@@ -1327,59 +1685,31 @@ h1 {{ color: {self.accentColor.name()}; margin: 4px 0 18px; }}
             )
 
     def on_profile_ready(self, generation: int, profile: AuthorProfileData) -> None:
-        if generation != self.profileGeneration:
+        entry = self._contentRequestEntries.pop(("profile", generation), None)
+        if generation != self.profileGeneration or entry is None:
             return
         key = profile.profile_url or profile.name
-        avatar = self.circular_avatar_uri(key, profile.name, self.avatarBytes, 72)
-        works = []
-        for work in profile.works:
-            details = " · ".join(
-                part
-                for part in (
-                    work.forum,
-                    f"{work.reply_count} 回复" if work.reply_count else "",
-                    f"发布于 {work.published}" if work.published else "",
-                    f"更新于 {work.last_updated}" if work.last_updated else "",
-                )
-                if part
-            )
-            works.append(
-                '<div class="work">'
-                f'<a class="work-title" href="{html.escape(work.url, quote=True)}">'
-                f'{html.escape(work.title)}</a>'
-                f'<div class="work-meta">{html.escape(details)}</div>'
-                '</div>'
-            )
-        content = f'''<!doctype html><html><head><meta charset="utf-8"/>
-<style>
-body {{ margin: 12px; color: #202124; font-family: "Microsoft YaHei", Arial, sans-serif; }}
-.profile {{ border-bottom: 1px solid #d9e2ec; padding: 8px 4px 18px; margin-bottom: 14px; }}
-.avatar {{ float: left; margin-right: 16px; }}
-.name {{ color: {self.accentColor.name()}; font-size: 24px; font-weight: bold; padding-top: 8px; }}
-.url {{ color: #667085; margin-top: 6px; }}
-.works {{ clear: both; padding-top: 12px; }}
-.work {{ border: 1px solid #d9e2ec; padding: 12px; margin-bottom: 10px; }}
-.work-title {{ color: {self.accentColor.name()}; font-size: 16px; font-weight: bold; text-decoration: none; }}
-.work-meta {{ color: #667085; margin-top: 6px; font-size: 12px; }}
-</style></head><body>
-<div class="profile"><img class="avatar" src="{avatar}" width="72" height="72"/>
-<div class="name">{html.escape(profile.name)}</div>
-<div class="url">{html.escape(profile.profile_url)}</div><div style="clear:both"></div></div>
-<h2>公开主题作品（{len(profile.works)}）</h2>
-<div class="works">{''.join(works) if works else '<p>没有搜索到公开主题。</p>'}</div>
-</body></html>'''
-        self.contentPage.set_html(f"{profile.name} · 个人主页", content)
+        if profile.avatar_bytes:
+            self.avatarBytes[key] = profile.avatar_bytes
+        avatar_uri = self.circular_avatar_uri(key, profile.name, self.avatarBytes, 76)
+        avatar = QPixmap()
+        avatar.loadFromData(base64.b64decode(avatar_uri.split(",", 1)[1]))
+        self.contentPage.set_profile(profile, avatar)
+        self._refresh_current_content_history(entry)
 
     def on_profile_failed(self, generation: int, message: str) -> None:
-        if generation == self.profileGeneration:
-            self.contentPage.set_error(message)
-            self.append_log("ERROR", time.strftime("%H:%M:%S"), message)
+        entry = self._contentRequestEntries.pop(("profile", generation), None)
+        if generation != self.profileGeneration or entry is None:
+            return
+        self.contentPage.set_error(message)
+        self._refresh_current_content_history(entry)
+        self.append_log("ERROR", time.strftime("%H:%M:%S"), message)
 
     def load_thread_in_viewer(self, thread_url: str) -> None:
-        self.viewerGeneration += 1
+        self._invalidate_content_requests()
         generation = self.viewerGeneration
-        self.contentPage.set_loading("正在读取帖子")
-        self.switchTo(self.contentPage)
+        entry = self._show_loading_content("正在读取帖子")
+        self._contentRequestEntries[("thread", generation)] = entry
         worker = ViewerThreadWorker(
             generation, thread_url, self.settingsPage.pageDelaySpin.value(), self
         )
@@ -1393,24 +1723,30 @@ body {{ margin: 12px; color: #202124; font-family: "Microsoft YaHei", Arial, san
     def on_viewer_thread_ready(
         self, generation: int, data: ThreadData, avatars: dict[str, bytes]
     ) -> None:
-        if generation == self.viewerGeneration:
-            self.avatarBytes.update(avatars)
-            self.contentAuthors = {
-                QUrl(author.profile_url).path(): author
-                for author in data.authors()
-                if author.profile_url
-            }
-            self.contentPage.set_html(
-                data.title, self.build_thread_view_html(data, avatars)
-            )
+        entry = self._contentRequestEntries.pop(("thread", generation), None)
+        if generation != self.viewerGeneration or entry is None:
+            return
+        self.avatarBytes.update(avatars)
+        self.contentAuthors = {
+            QUrl(author.profile_url).path(): author
+            for author in data.authors()
+            if author.profile_url
+        }
+        self.contentPage.set_html(
+            data.title, self.build_thread_view_html(data, avatars)
+        )
+        self._refresh_current_content_history(entry)
 
     def on_viewer_thread_failed(self, generation: int, message: str) -> None:
-        if generation == self.viewerGeneration:
-            self.contentPage.set_error(message)
+        entry = self._contentRequestEntries.pop(("thread", generation), None)
+        if generation != self.viewerGeneration or entry is None:
+            return
+        self.contentPage.set_error(message)
+        self._refresh_current_content_history(entry)
 
     def on_content_link(self, value: str) -> None:
         url = QUrl(value)
-        if url.host().lower() == "mirror.chromaso.net":
+        if is_supported_host(url.host()):
             path = url.path()
             if path.startswith("/thread/"):
                 self.load_thread_in_viewer(value)

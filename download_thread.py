@@ -21,7 +21,16 @@ import requests
 from bs4 import BeautifulSoup, Tag
 
 
-BASE = "https://mirror.chromaso.net"
+PRIMARY_HOST = "mirror.chromaso.net"
+SUPPORTED_HOSTS = frozenset(
+    {
+        PRIMARY_HOST,
+        "1011.lol",
+        "maso.top",
+        "moemoe.cloud",
+    }
+)
+BASE = f"https://{PRIMARY_HOST}"
 LOG_LEVELS = ("INFO", "WARNING", "ERROR")
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -63,6 +72,8 @@ class AuthorProfileData:
     name: str
     profile_url: str
     avatar_url: str
+    bio: str = ""
+    avatar_bytes: bytes = b""
     works: list[AuthorWork] = field(default_factory=list)
     profile_requires_login: bool = True
 
@@ -84,6 +95,7 @@ class ThreadData:
     title: str
     url: str
     posts: list[Post] = field(default_factory=list)
+    tags: list[tuple[str, str]] = field(default_factory=list)
     page_count: int = 0
     assets: dict[str, Asset] = field(default_factory=dict)
 
@@ -110,21 +122,34 @@ class ThreadData:
         return [p for p in self.posts if (p.profile_url or p.author) in keys]
 
 
+def is_supported_host(host: str) -> bool:
+    """判断域名是否属于主站或已知镜像站。"""
+    return host.lower().rstrip(".") in SUPPORTED_HOSTS
+
+
+def site_base_for_url(value: str) -> str:
+    """从站内 URL 取得对应镜像的 HTTPS 根地址。"""
+    host = (urlparse(value).hostname or "").lower().rstrip(".")
+    return f"https://{host}" if is_supported_host(host) else BASE
+
+
 def normalize_url(value: str) -> str:
-    """接受主题 ID 或完整主题网址，并移除尾部页码。"""
+    """接受主站/镜像站主题 ID 或网址，并移除尾部页码。"""
     value = value.strip()
     if value.isdigit():
         return f"{BASE}/thread/{value}"
-    if value.lower().startswith("mirror.chromaso.net/"):
+    if any(value.lower().startswith(f"{host}/") for host in SUPPORTED_HOSTS):
         value = "https://" + value
     parsed = urlparse(value)
-    host = (parsed.hostname or "").lower()
-    if parsed.scheme not in {"http", "https"} or host != "mirror.chromaso.net":
-        raise ValueError("只接受 mirror.chromaso.net 的主题 URL 或纯数字主题 ID")
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if parsed.scheme not in {"http", "https"} or not is_supported_host(host):
+        domains = "、".join(sorted(SUPPORTED_HOSTS))
+        raise ValueError(f"只接受这些站点的主题 URL：{domains}，或纯数字主题 ID")
     match = re.fullmatch(r"/thread/(\d+)(?:/\d+)?/?", parsed.path)
     if not match:
-        raise ValueError("URL 格式应为 https://mirror.chromaso.net/thread/主题ID")
-    return f"{BASE}/thread/{match.group(1)}"
+        raise ValueError("URL 格式应为 https://站点域名/thread/主题ID")
+    # 保留用户选择的镜像域名；纯数字 ID 才默认使用主域名。
+    return f"https://{host}/thread/{match.group(1)}"
 
 
 def _clean_text(node: Tag) -> str:
@@ -206,6 +231,21 @@ def _clean_html(node: Tag, page_url: str) -> str:
                     parts[0] = urljoin(page_url, parts[0])
                     rewritten.append(" ".join(parts))
             element["srcset"] = ", ".join(rewritten)
+    # 镜像正文中常用空 p/div/br 撑开图片区。富文本阅读与导出时这些节点会
+    # 被 QTextDocument 放大成明显空白；移除无内容的占位块并压缩连续换行。
+    for element in list(clone.find_all(["p", "div", "span"])):
+        if element.find(["img", "video", "audio", "table", "blockquote"]):
+            continue
+        if not element.get_text(strip=True):
+            element.decompose()
+    previous_was_break = False
+    for node in list(clone.find_all("br")):
+        if previous_was_break:
+            node.decompose()
+        else:
+            previous_was_break = True
+        if node.next_sibling and getattr(node.next_sibling, "name", None) not in {"br", None}:
+            previous_was_break = False
     return "".join(str(child) for child in clone.contents).strip()
 
 
@@ -293,12 +333,15 @@ class ThreadDownloader:
             except Exception:
                 pass
 
-    def _get_soup(self, url: str) -> BeautifulSoup:
+    def _get_soup(
+        self, url: str, allowed_statuses: tuple[int, ...] = ()
+    ) -> BeautifulSoup:
         self._log("INFO", f"GET {url}")
         try:
             response = self.session.get(url, timeout=self.timeout)
             self._log("INFO", f"HTTP {response.status_code}，响应 {len(response.content)} 字节")
-            response.raise_for_status()
+            if response.status_code not in allowed_statuses:
+                response.raise_for_status()
         except requests.RequestException as exc:
             self._log("ERROR", f"请求失败：{exc}")
             raise
@@ -336,6 +379,15 @@ class ThreadDownloader:
                     soup.title.get_text(strip=True) if soup.title else data.title
                 )
                 data.title = re.sub(r"^M系镜像\s*[-–—]\s*", "", data.title)
+                seen_tags: set[str] = set()
+                for tag_link in soup.select("a[href^='/tag/']"):
+                    tag_url = urljoin(page_url, str(tag_link.get("href", "")))
+                    tag_name = re.sub(
+                        r"\s*(?:report_problem|add)\s*$", "", _clean_text(tag_link)
+                    ).strip()
+                    if tag_name and tag_url not in seen_tags:
+                        seen_tags.add(tag_url)
+                        data.tags.append((tag_name, tag_url))
                 self._log("INFO", f"主题标题：{data.title}")
 
             nodes = _find_posts(soup)
@@ -454,10 +506,188 @@ class ThreadDownloader:
         max_pages: int = 1000,
         progress=None,
     ) -> AuthorProfileData:
-        """获取公开可见的作者主题作品；作者资料页本身可能要求登入。"""
+        """获取作者的全部公开主题。
+
+        优先读取个人主页：作品较少时主页直接包含完整列表；作品较多时则
+        跟随主页上的“全部”链接进入站点生成的随机搜索结果页。若个人主页
+        要求登入，则退回公开的作者主题搜索。
+        """
         if not author_name.strip():
             raise ValueError("作者名称不能为空")
         profile = AuthorProfileData(author_name.strip(), profile_url, avatar_url)
+        seen_urls: set[str] = set()
+
+        if profile_url:
+            self._log("INFO", f"读取作者主页：{profile_url}")
+            # 站点会以 401/403 状态返回带有登入说明的完整 HTML 页面。
+            # 允许解析这两个状态，再无缝回退到公开搜索。
+            profile_soup = self._get_soup(profile_url, allowed_statuses=(401, 403))
+            page_text = profile_soup.get_text(" ", strip=True)
+            login_required = (
+                "此页面需要登入后才可查看" in page_text
+                or (
+                    profile_soup.select_one("input[type='password']") is not None
+                    and "登入" in page_text
+                )
+            )
+            profile.profile_requires_login = login_required
+            if not login_required:
+                self._update_profile_identity(profile, profile_soup, profile_url)
+                all_url = self._find_profile_all_url(profile_soup, profile_url)
+                if all_url:
+                    self._log("INFO", f"发现作者主页“全部”入口：{all_url}")
+                    return self._fetch_author_result_pages(
+                        profile,
+                        all_url,
+                        page_delay,
+                        max_pages,
+                        progress,
+                        seen_urls,
+                    )
+
+                added = self._parse_profile_works(
+                    profile, profile_soup, profile_url, seen_urls
+                )
+                self._log(
+                    "INFO",
+                    f"作者主页没有“全部”入口；已直接读取 {added} 个主题",
+                )
+                if added:
+                    if progress:
+                        progress(1, len(profile.works))
+                    return profile
+                self._log(
+                    "WARNING",
+                    "作者主页未识别到主题列表，改用公开作者主题搜索",
+                )
+
+            self._log("INFO", "作者主页要求登入，改用公开作者主题搜索")
+
+        return self._fetch_author_by_public_search(
+            profile, page_delay, max_pages, progress, seen_urls
+        )
+
+    def _update_profile_identity(
+        self, profile: AuthorProfileData, soup: BeautifulSoup, page_url: str
+    ) -> None:
+        """从可访问的主页补全当前用户名及头像。"""
+        heading = soup.select_one(
+            "main h1, main h2, .profile h1, .profile h2, .author-name, .username"
+        )
+        if heading:
+            name = _clean_text(heading)
+            if name:
+                profile.name = name
+        avatar = soup.select_one(
+            "main img.mm-img-ava, main img.avatar, main .avatar img, "
+            "main img[src*='avatar']"
+        )
+        if avatar:
+            source = _first_attr(avatar, ("src", "data-src", "data-original"))
+            if source:
+                profile.avatar_url = urljoin(page_url, source)
+        bio_node = soup.select_one(
+            "main .profile-intro, main .user-intro, main .author-intro, "
+            "main [data-profile-intro], main .bio, main .about, main .description"
+        )
+        if bio_node:
+            bio = _clean_text(bio_node)
+            if bio:
+                profile.bio = re.sub(r"^(个人介绍|简介)\s*[:：]?\s*", "", bio)
+        if not profile.bio:
+            label = soup.find(string=re.compile(r"^\s*(个人介绍|简介)\s*[:：]?\s*$"))
+            if label:
+                container = label.parent.find_parent(["div", "section", "article", "li"])
+                if container:
+                    text = _clean_text(container)
+                    profile.bio = re.sub(
+                        r"^(个人介绍|简介)\s*[:：]?\s*", "", text
+                    )
+
+    def _find_profile_all_url(
+        self, soup: BeautifulSoup, page_url: str
+    ) -> str | None:
+        """找出主页主题区域的“全部”链接，不猜测随机搜索结果 ID。"""
+        candidates: list[tuple[int, str]] = []
+        for link in soup.select("a[href]"):
+            label = _clean_text(link)
+            if "全部" not in label and "查看全部" not in label:
+                continue
+            href = str(link.get("href", "")).strip()
+            if not href or href.lower().startswith("javascript:"):
+                continue
+            absolute = urljoin(page_url, href)
+            parsed = urlparse(absolute)
+            if not is_supported_host(parsed.hostname or ""):
+                continue
+            context_node = link.find_parent(["section", "article", "table", "div"])
+            context = _clean_text(context_node)[:300] if context_node else label
+            score = 1
+            if re.search(r"/search/\d+", parsed.path):
+                score += 6
+            if "主题" in context or "作品" in context:
+                score += 4
+            if "回复" in context or "文章" in context:
+                score -= 2
+            candidates.append((score, absolute))
+        return max(candidates, default=(0, ""), key=lambda item: item[0])[1] or None
+
+    def _parse_profile_works(
+        self,
+        profile: AuthorProfileData,
+        soup: BeautifulSoup,
+        page_url: str,
+        seen_urls: set[str],
+    ) -> int:
+        """解析没有“全部”按钮时个人主页中直接列出的少量主题。"""
+        scope = soup.select_one("main") or soup
+        added = 0
+        for link in scope.select("a[href]"):
+            href = str(link.get("href", ""))
+            if not re.match(r"^/thread/\d+/?(?:[?#].*)?$", href):
+                continue
+            url = urljoin(page_url, href.split("#", 1)[0].split("?", 1)[0])
+            if url in seen_urls:
+                continue
+            title = _clean_text(link)
+            if not title:
+                continue
+            container = link.find_parent(["tr", "article", "li", "section", "div"])
+            forum = ""
+            published = ""
+            last_updated = ""
+            if container:
+                forum_link = container.find("a", href=re.compile(r"^/forum/\d+"))
+                forum = _clean_text(forum_link) if forum_link else ""
+                times = container.select("time")
+                parsed_times = [
+                    _first_attr(node, ("datetime", "title")) or _clean_text(node)
+                    for node in times[:2]
+                ]
+                if parsed_times:
+                    published = parsed_times[0]
+                    last_updated = parsed_times[-1]
+            profile.works.append(
+                AuthorWork(
+                    title=title,
+                    url=url,
+                    forum=forum,
+                    published=published,
+                    last_updated=last_updated,
+                )
+            )
+            seen_urls.add(url)
+            added += 1
+        return added
+
+    def _fetch_author_by_public_search(
+        self,
+        profile: AuthorProfileData,
+        page_delay: float,
+        max_pages: int,
+        progress,
+        seen_urls: set[str],
+    ) -> AuthorProfileData:
         query_parameters = {
             'type': 'thread',
             'query': '',
@@ -465,23 +695,56 @@ class ThreadDownloader:
             'forum': '0',
             'sort': 'reply',
         }
-        query_url = f"{BASE}/query?{urlencode(query_parameters)}"
+        # 作者主页来自哪个镜像，公开搜索也继续走同一个镜像，避免又跳回
+        # 主域名而失去备用域名的意义。
+        query_url = (
+            f"{site_base_for_url(profile.profile_url)}/query?"
+            f"{urlencode(query_parameters)}"
+        )
         self._log("INFO", f"搜索作者主题：{profile.name}")
         soup = self._get_soup(query_url)
         result_link = soup.find("a", href=re.compile(r"^/search/\d+/?$"))
         if not result_link:
             raise RuntimeError("网站没有返回作者作品搜索结果地址")
         result_url = urljoin(query_url, str(result_link.get("href", "")))
-        current_offset = 0
-        seen_urls: set[str] = set()
+        return self._fetch_author_result_pages(
+            profile,
+            result_url,
+            page_delay,
+            max_pages,
+            progress,
+            seen_urls,
+        )
+
+    def _fetch_author_result_pages(
+        self,
+        profile: AuthorProfileData,
+        result_url: str,
+        page_delay: float,
+        max_pages: int,
+        progress,
+        seen_urls: set[str],
+    ) -> AuthorProfileData:
+        """读取站点生成的 /search/<随机ID> 结果及全部偏移分页。"""
+        offset_match = re.search(r"/\+(\d+)(?:[/?#]|$)", result_url)
+        current_offset = int(offset_match.group(1)) if offset_match else 0
+        visited_pages: set[str] = set()
 
         for page_number in range(1, max_pages + 1):
-            # 搜索任务由站点异步生成，短暂轮询等待表格出现。
+            if result_url in visited_pages:
+                self._log("WARNING", "作者作品分页出现循环，已停止")
+                break
+            visited_pages.add(result_url)
+
+            # 搜索任务由站点异步生成。即使已出现部分表格，只要页面仍显示
+            # “搜索进行中”就继续等待，避免把未完成的结果误当作最终结果。
             for attempt in range(12):
                 soup = self._get_soup(result_url)
-                if soup.select_one("table tbody") or "搜索进行中" not in soup.get_text():
+                if "搜索进行中" not in soup.get_text(" ", strip=True):
                     break
                 time.sleep(0.5)
+            else:
+                self._log("WARNING", "作者作品搜索等待超时，将使用当前已生成结果")
             rows = soup.select("table tbody tr")
             new_count = 0
             last_work: AuthorWork | None = None
@@ -542,6 +805,7 @@ class ThreadDownloader:
                 break
             current_offset, result_url = min(offsets, key=lambda item: item[0])
             if page_delay > 0:
+                self._log("INFO", f"等待 {page_delay:g} 秒后读取作者作品下一页")
                 time.sleep(page_delay)
         else:
             raise RuntimeError(f"作者作品已达到最大页数 {max_pages}")
@@ -614,6 +878,32 @@ h1 { line-height: 1.3; margin-bottom: .5rem; }
                         padding: .4rem .8rem; background: #f5f9fd; }
 .post-body pre { white-space: pre-wrap; }
 @media print { body { max-width: none; margin: 0; } .post { break-inside: avoid; } }
+"""
+
+EXPORT_CSS = """
+body { margin: 2rem auto; max-width: 1040px; padding: 0 1rem; color: #596577;
+       background: #fcfcfd; font-family: 'Microsoft YaHei', Arial, sans-serif; line-height: 1.72; }
+h1 { color: #5a6577; font-size: 2rem; font-weight: 400; line-height: 1.3; margin: .3rem 0 1rem; }
+.thread-meta { color: #8a93a1; font-size: .9rem; margin-bottom: 1rem; }
+.thread-tags { margin: 0 0 1.25rem; }
+.tag { background: #edf1f5; border: 1px solid #dce3ea; border-radius: 1rem; color: #788699;
+       display: inline-block; font-size: .78rem; margin: 0 .35rem .35rem 0; padding: .18rem .6rem; text-decoration: none; }
+.post { background: #fff; border: 1px solid #d7d9df; border-radius: 6px; margin: 0 0 1.15rem;
+        overflow: hidden; break-inside: avoid; page-break-inside: avoid; }
+.post-header { background: #f5f5f7; border-bottom: 1px solid #d7d9df; padding: .7rem 1rem; }
+.post-author { color: #c27699; font-size: 1rem; font-weight: 700; text-decoration: none; }
+.post-title { color: #7e8795; font-size: .84rem; margin-left: .7rem; }
+.post-time { color: #8a93a1; float: right; font-size: .82rem; white-space: nowrap; }
+.post-body { color: #5b6677; padding: 1rem; }
+.post-body p { margin: 0 0 .7rem; }
+.post-body img { display: block; height: auto; margin: .45rem 0; max-width: 100%; }
+.post-body a, .post-author { color: #4e88b3; text-decoration: underline; }
+.post-links { background: #f8fafc; border-top: 1px solid #edf0f3; color: #718095; font-size: .78rem; padding: .45rem 1rem; }
+.post-links ul { margin: .25rem 0 0; padding-left: 1.1rem; }
+.post-links a { color: #3176a8; text-decoration: underline; }
+.post-links span { color: #8793a2; word-break: break-all; }
+.post-footer { border-top: 1px solid #e2e3e6; color: #78a9cb; font-size: .78rem; padding: .55rem 1rem; }
+blockquote { background: #f7f8fa; border-left: 3px solid #c9d0da; color: #6c7686; margin: .5rem 0; padding: .5rem .7rem; }
 """
 
 PDF_CSS = """
@@ -705,12 +995,28 @@ def _rewrite_post_images(body_html: str, resolver) -> str:
     return str(fragment)
 
 
+def _post_link_targets(body_html: str) -> list[tuple[str, str]]:
+    """提取正文链接，为 PDF 提供可见的 URL 兜底信息。"""
+    fragment = BeautifulSoup(body_html, "html.parser")
+    targets: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for anchor in fragment.select("a[href]"):
+        href = str(anchor.get("href", "")).strip()
+        if not href or href in seen or urlparse(href).scheme not in {"http", "https", "mailto"}:
+            continue
+        seen.add(href)
+        label = _clean_text(anchor) or href
+        targets.append((label, href))
+    return targets[:20]
+
+
 def build_html_document(
     data: ThreadData,
     author_keys: set[str] | list[str],
     image_resolver=None,
     xhtml: bool = False,
     css: str = EXPORT_CSS,
+    show_link_targets: bool = False,
 ) -> str:
     posts = _selected_posts(data, author_keys)
     resolver = image_resolver or (lambda url: url)
@@ -722,24 +1028,43 @@ def build_html_document(
             else html.escape(post.author)
         )
         body = _rewrite_post_images(post.body_html, resolver)
+        post_title = data.title if post.floor == 1 else f"Re: {data.title}"
+        link_targets = _post_link_targets(post.body_html) if show_link_targets else []
+        links = "".join(
+            f'<li><a href="{html.escape(href, quote=True)}">{html.escape(label)}</a> '
+            f'<span>{html.escape(href)}</span></li>'
+            for label, href in link_targets
+        )
+        link_block = (
+            f'<div class="post-links"><b>链接：</b><ul>{links}</ul></div>'
+            if links
+            else ""
+        )
         articles.append(
             '<article class="post">'
             '<header class="post-header">'
-            f'<span class="post-floor">原主题第 {post.floor} 楼</span>'
             f'<span class="post-author">{profile}</span>'
+            f'<span class="post-title">{html.escape(post_title)}</span>'
             f'<span class="post-time">{html.escape(post.published)}</span>'
             '</header>'
             f'<div class="post-body">{body}</div>'
+            f'{link_block}'
+            f'<footer class="post-footer">第 {post.floor} 楼</footer>'
             '</article>'
         )
     prefix = '<?xml version="1.0" encoding="utf-8"?>\n' if xhtml else '<!doctype html>\n'
     namespace = ' xmlns="http://www.w3.org/1999/xhtml"' if xhtml else ""
+    tags = "".join(
+        f'<a class="tag" href="{html.escape(url, quote=True)}">{html.escape(name)}</a>'
+        for name, url in data.tags
+    )
     return (
         f'{prefix}<html{namespace} lang="zh-CN"><head><meta charset="utf-8"/>'
         f'<title>{html.escape(data.title)}</title><style>{css}</style></head><body>'
         f'<h1>{html.escape(data.title)}</h1>'
         f'<div class="thread-meta">来源：<a href="{html.escape(data.url, quote=True)}">'
         f'{html.escape(data.url)}</a> · 导出 {len(posts)} 条发言</div>'
+        f'<div class="thread-tags">{tags}</div>'
         + "".join(articles)
         + "</body></html>"
     )
@@ -810,7 +1135,8 @@ def _export_pdf(data: ThreadData, path: Path, author_keys: set[str] | list[str])
             data,
             author_keys,
             lambda url: resource_names.get(url, (url, None)),
-            css=PDF_CSS,
+            css=EXPORT_CSS,
+            show_link_targets=True,
         )
     )
     printer = QPrinter(QPrinter.HighResolution)
@@ -858,7 +1184,7 @@ def _export_epub(data: ThreadData, path: Path, author_keys: set[str] | list[str]
         author_keys,
         lambda url: asset_names.get(url, url),
         xhtml=True,
-        css=EPUB_CSS,
+        css=EXPORT_CSS,
     )
     book_id = f"urn:uuid:{uuid.uuid4()}"
     manifest = "".join(
